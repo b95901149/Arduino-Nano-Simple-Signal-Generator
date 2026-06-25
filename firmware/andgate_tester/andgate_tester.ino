@@ -1,6 +1,7 @@
 /*
  * Arduino Nano AND Gate Tester (ATmega328P) — Master
- * D2/D3 = waveform, D5-D8 = inputs, D9/D12/D13 = GPIO outputs
+ * D2/D3 = waveform, D5-D8 = inputs, D9/D13 = GPIO outputs
+ * D12 = SS comm gate trigger (OUTPUT → slave D12)
  * D10/D11 = SoftwareSerial to slave (RX=10, TX=11)
  * USB Serial @ 115200 baud
  */
@@ -19,11 +20,14 @@
 
 static const uint8_t SS_RX_PIN = 10;
 static const uint8_t SS_TX_PIN = 11;
+static const uint8_t TRIGGER_PIN = 12;
 static const uint32_t SS_BAUD = 9600;
-static const uint32_t SS_TIMEOUT_MS = 500UL;
+static const uint32_t SS_TIMEOUT_MS = 800UL;
+static const uint16_t SS_TRIGGER_SETTLE_MS = 5U;
 
 static const uint8_t INPUT_PINS[] = {5, 6, 7, 8};
-static const uint8_t OUTPUT_PINS[] = {9, 12, 13};
+static const uint8_t OUTPUT_PINS[] = {9, 13};
+static const uint8_t OUTPUT_PIN_COUNT = 2;
 
 static SoftwareSerial g_softSerial(SS_RX_PIN, SS_TX_PIN);
 
@@ -87,21 +91,47 @@ static void sendSsDiag(void) {
   Serial.print(SS_RX_PIN);
   Serial.print(F(",TX=D"));
   Serial.print(SS_TX_PIN);
+  Serial.print(F(",TRIG=D"));
+  Serial.print(TRIGGER_PIN);
   Serial.print(F(",BAUD="));
   Serial.print(SS_BAUD);
   Serial.print(F(",AVAIL="));
   Serial.println(g_softSerial.available());
 }
 
+static void ssTriggerBegin(void) {
+  digitalWrite(TRIGGER_PIN, HIGH);
+  delay(SS_TRIGGER_SETTLE_MS);
+}
+
+static void ssTriggerEnd(void) {
+  delay(1);
+  digitalWrite(TRIGGER_PIN, LOW);
+}
+
 static void forwardToSlave(const char *cmd) {
+  uint8_t was_running = g_running;
+  if (was_running) {
+    haltOutput();
+  }
+
   while (g_softSerial.available() > 0) {
     (void)g_softSerial.read();
   }
+  ssTriggerBegin();
   g_softSerial.print(cmd);
   g_softSerial.print('\n');
+  g_softSerial.flush();
 
   char resp[80];
-  if (readSoftSerialLine(resp, sizeof(resp))) {
+  bool ok = readSoftSerialLine(resp, sizeof(resp));
+  ssTriggerEnd();
+
+  if (was_running) {
+    startOutput();
+  }
+
+  if (ok) {
     Serial.print(F("SSR:"));
     Serial.println(resp);
   } else {
@@ -119,7 +149,10 @@ static void gpioInit(void) {
     pinMode(INPUT_PINS[i], INPUT);
   }
 
-  for (uint8_t i = 0; i < 3; i++) {
+  pinMode(TRIGGER_PIN, OUTPUT);
+  digitalWrite(TRIGGER_PIN, LOW);
+
+  for (uint8_t i = 0; i < OUTPUT_PIN_COUNT; i++) {
     uint8_t pin = OUTPUT_PINS[i];
     pinMode(pin, OUTPUT);
     digitalWrite(pin, LOW);
@@ -245,13 +278,13 @@ static void sendInputs(void) {
 }
 
 static void sendOutputs(void) {
-  for (uint8_t i = 0; i < 3; i++) {
+  for (uint8_t i = 0; i < OUTPUT_PIN_COUNT; i++) {
     uint8_t pin = OUTPUT_PINS[i];
     Serial.print(F("D"));
     Serial.print(pin);
     Serial.print(F("="));
     Serial.print(digitalRead(pin));
-    if (i < 2) {
+    if (i + 1 < OUTPUT_PIN_COUNT) {
       Serial.print(F(","));
     }
   }
@@ -275,7 +308,7 @@ static bool parseUint(const char *s, uint32_t *out) {
 }
 
 static bool isOutputPin(uint8_t pin) {
-  for (uint8_t i = 0; i < 3; i++) {
+  for (uint8_t i = 0; i < OUTPUT_PIN_COUNT; i++) {
     if (OUTPUT_PINS[i] == pin) {
       return true;
     }

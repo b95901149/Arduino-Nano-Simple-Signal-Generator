@@ -52,27 +52,32 @@ READY ANDGATE_TESTER
 |------|------|------|
 | `IN?` | 讀取 D5、D6、D7、D8 狀態 | `IN?` |
 
-### 數位輸出（主核心 D9 / D12 / D13）
+### 數位輸出（主核心 D9 / D13）
 
 | 指令 | 說明 | 範例 |
 |------|------|------|
 | `OUT:<pin>:<level>` | 設定輸出腳位 High/Low | `OUT:9:1` |
-| `OUT:D<pin>:<level>` | 同上，可帶 D 前綴 | `OUT:D12:1` |
-| `OUT?` | 查詢 D9 / D12 / D13 狀態 | `OUT?` |
+| `OUT:D<pin>:<level>` | 同上，可帶 D 前綴 | `OUT:D13:1` |
+| `OUT?` | 查詢 D9 / D13 狀態 | `OUT?` |
 
-> D10、D11 保留給 **SoftwareSerial**（9600 baud），不可作 GPIO 輸出。
+> D10、D11 保留給 **SoftwareSerial**（9600 baud）。  
+> D12 保留給 **副核心觸發閘門**（OUTPUT → 副 D12）。
 
-### 副核心轉送（SoftwareSerial D10/D11）
+### 副核心轉送（SoftwareSerial + D12 觸發）
 
 | 指令 | 說明 | 範例 |
 |------|------|------|
 | `SS:<cmd>` | 轉送指令至副核心 Arduino | `SS:PING` |
+| `SVAR?` / `SVAR:...` | 讀寫副核心 EEPROM 變數 A~E | `SVAR:E:2.0` |
+| `SSDIAG?` | 查詢主核心 SS 埠狀態 | `SSDIAG?` |
 | 回應 | 副核心回應以 `SSR:` 為前綴 | `SSR:PONG` |
 
-副核心使用 `firmware/slave_core/slave_core.ino`，支援：`PING`、`STATUS?`、`IN?`、`OUT?`、`OUT:<pin>:<0\|1>`、`BLINK:<ms>`、`BLINK:0`（D13 閃爍週期 100~5000 ms）。
+> 完整主副核心 API 請見 [API.md](API.md)。
+
+副核心支援：`PING`、`STATUS?`、`IN?`、`OUT?`、`OUT:<pin>:<0\|1>`、`BLINK:<ms>`、`BLINK:0`、`VAR?`、`VAR:...`（D13 閃爍週期 100~5000 ms；變數 E 為閃爍秒數）。
 
 `<level>`：`0` = LOW，`1` = HIGH  
-`<pin>`：僅接受 **9、10、11、12、13**
+`<pin>`（副核心輸出）：**9、13**；主核心輸出：**9、13**
 
 ---
 

@@ -34,8 +34,8 @@ DEFAULT_FREQ_HZ = 20000
 DEFAULT_PHASE_DEG = 0
 BAUD_RATE = 115200
 INPUT_PINS = (5, 6, 7, 8)
-OUTPUT_PINS = (9, 12, 13)
-SLAVE_OUTPUT_PINS = (9, 12, 13)
+OUTPUT_PINS = (9, 13)
+SLAVE_OUTPUT_PINS = (9, 13)
 POLL_MS = 250
 PORT_SCAN_MS = 1500
 SLAVE_MONITOR_MS = 50
@@ -64,13 +64,17 @@ DOCS_TEXT = """\
   D2      信號 A（方波輸出）
   D3      信號 B（方波輸出，可調相位）
   D5–D8   數位輸入（自動掃描顯示 HIGH / LOW）
-  D9/D12/D13  主核心數位輸出
+  D9/D13  主核心數位輸出
+  D12     主→副通訊觸發 (OUTPUT→INPUT)
   D10/D11 SoftwareSerial 9600 → 副核心 Arduino
 
-【副核心接線（Software Serial）】
+【副核心接線（Software Serial + D12 觸發）】
   主 D11 (TX) ──► 副 D10 (RX)
   主 D10 (RX) ◄── 副 D11 (TX)
+  主 D12 (TRIG) ──► 副 D12 (TRIG, 中斷)
   GND 共地
+
+  主核心僅在 D12 觸發期間送出 SS 指令；副核心未觸發時執行本機任務（LED 閃爍等）。
 
 【快速操作】
   1. 啟動 GUI，程式會自動掃描 COM 埠
@@ -78,7 +82,7 @@ DOCS_TEXT = """\
   3. 設定頻率（預設 20000 Hz）→ 按「套用頻率」
   4. 按「開始輸出」產生 D2/D3 方波
   5. 拖動相位滑桿可即時調整兩通道相位差
-  6. D5–D8 輸入狀態自動更新；D9/D12/D13 可手動切換輸出
+  6. D5–D8 輸入狀態自動更新；D9/D13 可手動切換輸出
   7. 「副核心」區塊透過 D10/D11 控制另一片 Arduino
 
 【AND 閘測試接線】
@@ -142,8 +146,8 @@ DOCS_TEXT = """\
   START / STOP    開始 / 停止方波輸出
   STATUS?         查詢波形狀態
   IN?             讀取 D5–D8 輸入
-  OUT:<pin>:<0|1> 設定 D9/D12/D13 輸出
-  OUT?            查詢 D9/D12/D13 輸出狀態
+  OUT:<pin>:<0|1> 設定 D9/D13 輸出
+  OUT?            查詢 D9/D13 輸出狀態
   SS:<cmd>        轉送指令至副核心（回應 SSR:...）
   SVAR? / SVAR:ALL:a,b,c,d,e  讀寫副核心 EEPROM 變數 A~E (float)
   副核心變更後會從 COM6 (USB) 送出 VARACK:...
@@ -314,7 +318,7 @@ class AndGateTesterApp:
             lbl.pack(side=tk.LEFT, padx=4)
             self._input_labels[pin] = lbl
 
-        out_frame = ttk.LabelFrame(io_frame, text="主核心輸出 D9/D12/D13", padding=8)
+        out_frame = ttk.LabelFrame(io_frame, text="主核心輸出 D9/D13", padding=8)
         out_frame.pack(side=tk.TOP, fill=tk.X)
         for pin in OUTPUT_PINS:
             row = ttk.Frame(out_frame)
@@ -333,7 +337,7 @@ class AndGateTesterApp:
             self._output_labels[pin] = st
 
         slave_frame = ttk.LabelFrame(
-            right_col, text="副核心 (Software Serial D10/D11 @ 9600)", padding=8
+            right_col, text="副核心 (SS D10/D11 + D12 觸發閘門)", padding=8
         )
         slave_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -356,7 +360,7 @@ class AndGateTesterApp:
             side=tk.LEFT, padx=2
         )
 
-        ss_io = ttk.LabelFrame(slave_frame, text="副核心輸出 D9/D12/D13", padding=6)
+        ss_io = ttk.LabelFrame(slave_frame, text="副核心輸出 D9/D13", padding=6)
         ss_io.pack(fill=tk.X, pady=4)
         for pin in SLAVE_OUTPUT_PINS:
             row = ttk.Frame(ss_io)
@@ -441,7 +445,7 @@ class AndGateTesterApp:
 
         diag_hint = ttk.Label(
             diag_frame,
-            text="組合型監聽 COM6：SSRXC / SSRX / VARACK",
+            text="D12 觸發時才處理 SS；未觸發時副核心執行本機 LED 閃爍。組合型可監聽 VARACK。",
             foreground="gray",
             wraplength=300,
         )
@@ -1109,6 +1113,17 @@ class AndGateTesterApp:
         except RuntimeError as exc:
             messagebox.showwarning("連線", str(exc))
 
+    def _ss_error_message(self, resp: str) -> str:
+        if resp == "ERR:SS_TIMEOUT":
+            return (
+                "副核心 SS 通訊逾時。\n"
+                "請確認：\n"
+                "• 主 D12 → 副 D12（觸發線）\n"
+                "• 主 D11→副 D10、主 D10←副 D11\n"
+                "• GND 共地"
+            )
+        return resp
+
     def _send_ss_command(self, cmd: str, log: bool = True) -> str:
         resp = self._send_command(f"SS:{cmd}", log=log)
         if resp.startswith("SSR:"):
@@ -1137,7 +1152,7 @@ class AndGateTesterApp:
             if resp == "PONG":
                 messagebox.showinfo("副核心", "連線正常 (PONG)")
             elif resp.startswith("ERR"):
-                messagebox.showwarning("副核心", resp)
+                messagebox.showwarning("副核心", self._ss_error_message(resp))
         except RuntimeError as exc:
             messagebox.showwarning("連線", str(exc))
 
@@ -1231,7 +1246,7 @@ class AndGateTesterApp:
                 lbl = self._slave_output_labels[13]
                 lbl.configure(text="BLINK", foreground="green")
             elif resp.startswith("ERR"):
-                messagebox.showwarning("LED 閃爍", resp)
+                messagebox.showwarning("LED 閃爍", self._ss_error_message(resp))
         except RuntimeError as exc:
             messagebox.showwarning("連線", str(exc))
 
@@ -1246,7 +1261,7 @@ class AndGateTesterApp:
                 lbl = self._slave_output_labels[13]
                 lbl.configure(text="LOW", foreground="gray")
             elif resp.startswith("ERR"):
-                messagebox.showwarning("LED 閃爍", resp)
+                messagebox.showwarning("LED 閃爍", self._ss_error_message(resp))
         except RuntimeError as exc:
             messagebox.showwarning("連線", str(exc))
 

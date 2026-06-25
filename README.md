@@ -13,6 +13,7 @@
 | [README.md](README.md) | 專案概覽（本文件） |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | 開發環境、建置燒錄、測試指令、開發歷程 |
 | [CLI.md](CLI.md) | **Serial CLI 控制指令完整手冊** |
+| [API.md](API.md) | **主副核心連線架構與 API 應用說明** |
 
 ## 系統架構
 

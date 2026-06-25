@@ -6,6 +6,7 @@
  * Wiring to master:
  *   Slave D10 (RX) <-- Master D11 (TX)
  *   Slave D11 (TX) --> Master D10 (RX)
+ *   Master D12 (TRIG OUT) --> Slave D12 (TRIG IN, interrupt)
  *   GND common
  */
 
@@ -17,12 +18,16 @@
 
 static const uint8_t SS_RX_PIN = 10;
 static const uint8_t SS_TX_PIN = 11;
+static const uint8_t TRIGGER_PIN = 12;
 static const uint32_t SS_BAUD = 9600;
 
 static const uint8_t INPUT_PINS[] = {5, 6, 7, 8};
-static const uint8_t OUTPUT_PINS[] = {9, 12, 13};
+static const uint8_t OUTPUT_PINS[] = {9, 13};
+static const uint8_t OUTPUT_PIN_COUNT = 2;
 
 static SoftwareSerial g_ss(SS_RX_PIN, SS_TX_PIN);
+
+static volatile uint8_t g_comm_gate = 0;
 
 static const uint8_t BLINK_LED_PIN = 13;
 static const uint32_t BLINK_MIN_MS = 100UL;
@@ -330,15 +335,44 @@ static void updateBlink(void) {
   digitalWrite(BLINK_LED_PIN, g_blink_led_on ? HIGH : LOW);
 }
 
+static void triggerIsr(void) {
+  g_comm_gate = digitalRead(TRIGGER_PIN) == HIGH ? 1 : 0;
+}
+
+static bool commGateOpen(void) {
+  return digitalRead(TRIGGER_PIN) == HIGH;
+}
+
+static void syncCommGate(void) {
+  g_comm_gate = commGateOpen() ? 1 : 0;
+}
+
+static void triggerInit(void) {
+  pinMode(TRIGGER_PIN, INPUT);
+  uint8_t irq = digitalPinToInterrupt(TRIGGER_PIN);
+  if (irq != NOT_AN_INTERRUPT) {
+    attachInterrupt(irq, triggerIsr, CHANGE);
+  }
+  syncCommGate();
+}
+
+static void discardSsStream(void) {
+  while (g_ss.available() > 0) {
+    (void)g_ss.read();
+  }
+  g_ss_line_len = 0;
+}
+
 static void gpioInit(void) {
   for (uint8_t i = 0; i < 4; i++) {
     pinMode(INPUT_PINS[i], INPUT);
   }
-  for (uint8_t i = 0; i < 3; i++) {
+  for (uint8_t i = 0; i < OUTPUT_PIN_COUNT; i++) {
     uint8_t pin = OUTPUT_PINS[i];
     pinMode(pin, OUTPUT);
     digitalWrite(pin, LOW);
   }
+  triggerInit();
 }
 
 static void sendInputs(Stream &out) {
@@ -353,13 +387,13 @@ static void sendInputs(Stream &out) {
 }
 
 static void sendOutputs(Stream &out) {
-  for (uint8_t i = 0; i < 3; i++) {
+  for (uint8_t i = 0; i < OUTPUT_PIN_COUNT; i++) {
     uint8_t pin = OUTPUT_PINS[i];
     out.print(F("D"));
     out.print(pin);
     out.print(F("="));
     out.print(digitalRead(pin));
-    if (i < 2) {
+    if (i + 1 < OUTPUT_PIN_COUNT) {
       out.print(F(","));
     }
   }
@@ -383,7 +417,7 @@ static bool parseUint(const char *s, uint32_t *out) {
 }
 
 static bool isOutputPin(uint8_t pin) {
-  for (uint8_t i = 0; i < 3; i++) {
+  for (uint8_t i = 0; i < OUTPUT_PIN_COUNT; i++) {
     if (OUTPUT_PINS[i] == pin) {
       return true;
     }
@@ -414,7 +448,9 @@ static void handleCommand(char *line, Stream &out) {
   }
 
   if (strcmp(line, "STATUS?") == 0) {
-    out.print(F("SLAVE:OK,BLINK="));
+    out.print(F("SLAVE:OK,GATE="));
+    out.print(g_comm_gate);
+    out.print(F(",BLINK="));
     out.print(g_blink_period_ms);
     out.print(F(",VAR:A="));
     out.print(g_vars.A, 3);
@@ -529,10 +565,18 @@ static void readUsbStream(void) {
 }
 
 static void readSsStream(void) {
+  if (!commGateOpen()) {
+    discardSsStream();
+    return;
+  }
+
   while (g_ss.available() > 0) {
+    if (!commGateOpen()) {
+      discardSsStream();
+      return;
+    }
     char c = (char)g_ss.read();
     g_ss_rx_char_count++;
-    echoSsRxChar(c);
 
     if (c == '\n' || c == '\r') {
       if (g_ss_line_len > 0) {
@@ -540,9 +584,8 @@ static void readSsStream(void) {
         strncpy(g_last_ss_line, g_ss_line_buf, sizeof(g_last_ss_line) - 1);
         g_last_ss_line[sizeof(g_last_ss_line) - 1] = '\0';
         g_ss_line_len = 0;
-        Serial.print(F("SSRX:"));
-        Serial.println(g_last_ss_line);
         handleCommand(g_ss_line_buf, g_ss);
+        g_ss.flush();
       }
     } else if (g_ss_line_len < sizeof(g_ss_line_buf) - 1) {
       g_ss_line_buf[g_ss_line_len++] = c;
@@ -555,11 +598,22 @@ void setup(void) {
   loadVarsFromEeprom();
   g_ss.begin(SS_BAUD);
   Serial.begin(115200);
+  syncEToBlink();
   g_ss.println(F("READY SLAVE"));
 }
 
 void loop(void) {
-  readSsStream();
+  syncCommGate();
+  if (commGateOpen()) {
+    for (uint8_t pass = 0; pass < 16 && commGateOpen(); pass++) {
+      readSsStream();
+      if (!g_ss.available()) {
+        break;
+      }
+    }
+  } else {
+    discardSsStream();
+  }
   readUsbStream();
   updateBlink();
 }
