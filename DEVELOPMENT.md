@@ -85,6 +85,18 @@ C:\ProgramData\anaconda3\python.exe "d:\python\arduino ANDgate tester\gui\main.p
 
 ---
 
+## 編譯 Windows 執行檔
+
+```powershell
+C:\ProgramData\anaconda3\python.exe -m pip install pyinstaller
+cd "d:\python\arduino ANDgate tester"
+.\scripts\build_exe.ps1
+```
+
+產出：`release\Arduino-Nano-Signal-Generator.exe`（約 7 MB，免安裝 Python）
+
+---
+
 ## 偵測 COM 埠
 
 ```powershell

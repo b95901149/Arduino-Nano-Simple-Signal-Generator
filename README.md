@@ -98,12 +98,27 @@ arduino ANDgate tester/
 ├── DEVELOPMENT.md
 ├── CLI.md
 ├── requirements.txt
+├── release/
+│   └── Arduino-Nano-Signal-Generator.exe   # Windows 執行檔
 ├── firmware/andgate_tester/andgate_tester.ino
 ├── gui/main.py
 └── tools/arduino-cli/
 ```
 
 ## 快速開始
+
+### 方式 A — Windows 執行檔（免安裝 Python）
+
+1. 下載並執行 [`release/Arduino-Nano-Signal-Generator.exe`](release/Arduino-Nano-Signal-Generator.exe)
+2. 燒錄韌體至 Arduino Nano（見下方）
+3. 選 COM 埠 → 連線 → 開始輸出
+
+### 方式 B — 原始碼執行
+
+```powershell
+C:\ProgramData\anaconda3\python.exe -m pip install -r requirements.txt
+C:\ProgramData\anaconda3\python.exe gui\main.py
+```
 
 ### 1. 燒錄韌體
 
@@ -116,13 +131,6 @@ $fqbn   = "arduino:avr:nano:cpu=atmega328old"
 ```
 
 或使用 Arduino IDE：Nano + **Old Bootloader**。詳見 [DEVELOPMENT.md](DEVELOPMENT.md)。
-
-### 2. 啟動 GUI
-
-```powershell
-C:\ProgramData\anaconda3\python.exe -m pip install -r requirements.txt
-C:\ProgramData\anaconda3\python.exe gui\main.py
-```
 
 COM 埠會自動掃描，連線後即可操作。說明與開發紀錄見 GUI **「說明」** 分頁。
 
