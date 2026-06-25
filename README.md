@@ -2,6 +2,10 @@
 
 以 Arduino Nano 產生兩路可調頻率、可調相位差的方波（D2、D3），並提供 D5–D8 輸入偵測、D9–D13 輸出控制；由 Serial 接收指令，Python GUI 遠端操作。
 
+## 主畫面
+
+![Arduino Nano Simple Signal Generator — GUI 主畫面](docs/images/gui-main.png)
+
 ## 文件索引
 
 | 文件 | 內容 |
