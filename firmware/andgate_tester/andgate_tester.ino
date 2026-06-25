@@ -7,6 +7,7 @@
 
 #include <Arduino.h>
 #include <SoftwareSerial.h>
+#include <stdio.h>
 #include <avr/interrupt.h>
 #include <avr/io.h>
 #include <string.h>
@@ -396,6 +397,18 @@ static void handleCommand(char *line) {
 
   if (strcmp(line, "SSDIAG?") == 0) {
     sendSsDiag();
+    return;
+  }
+
+  if (strcmp(line, "SVAR?") == 0) {
+    forwardToSlave("VAR?");
+    return;
+  }
+
+  if (strncmp(line, "SVAR:", 5) == 0) {
+    char fwd[84];
+    snprintf(fwd, sizeof(fwd), "VAR:%s", line + 5);
+    forwardToSlave(fwd);
     return;
   }
 

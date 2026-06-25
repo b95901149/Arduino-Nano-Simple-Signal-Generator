@@ -21,6 +21,7 @@ _configure_frozen_tcl_tk()
 
 import re
 import time
+import atexit
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 from typing import Dict, List, Optional, Tuple
@@ -44,7 +45,11 @@ BLINK_MIN_SEC = 0.1
 BLINK_MAX_SEC = 5.0
 BLINK_DEFAULT_SEC = 1.0
 
+SLAVE_VAR_NAMES = ("A", "B", "C", "D", "E")
+VAR_ACK_WAIT_MS = 1200
+
 ARDUINO_PORT_HINTS = ("ch340", "arduino", "usb-serial", "ftdi", "cp210", "wch")
+VAR_LINE_RE = re.compile(r"([ABCDE])=([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)")
 
 DOCS_TEXT = """\
 ═══════════════════════════════════════
@@ -140,7 +145,8 @@ DOCS_TEXT = """\
   OUT:<pin>:<0|1> 設定 D9/D12/D13 輸出
   OUT?            查詢 D9/D12/D13 輸出狀態
   SS:<cmd>        轉送指令至副核心（回應 SSR:...）
-  SSDIAG?         查詢主核心 SoftwareSerial 狀態
+  SVAR? / SVAR:ALL:a,b,c,d,e  讀寫副核心 EEPROM 變數 A~E (float)
+  副核心變更後會從 COM6 (USB) 送出 VARACK:...
 
 【組合型診斷】
   同時連線主核心 USB + 副核心 USB，監看副核心 SSRXC/SSRX 行
@@ -154,7 +160,7 @@ class AndGateTesterApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Arduino Nano Simple Signal Generator")
-        self.root.minsize(540, 720)
+        self.root.minsize(880, 720)
 
         self._serial: Optional[serial.Serial] = None
         self._slave_serial: Optional[serial.Serial] = None
@@ -172,10 +178,17 @@ class AndGateTesterApp:
         self._blink_job: Optional[str] = None
         self._last_blink_ms: Optional[int] = None
         self._blink_running = False
+        self._slave_var_vars: Dict[str, tk.StringVar] = {
+            name: tk.StringVar(value="1.0" if name == "E" else "0.0")
+            for name in SLAVE_VAR_NAMES
+        }
+        self._var_ack_var = tk.StringVar(value="尚未更新 EEPROM 變數")
+        self._closing = False
 
         self._build_ui()
         self._refresh_ports()
         self._start_port_scan()
+        atexit.register(self._atexit_release_ports)
 
     def _build_ui(self) -> None:
         notebook = ttk.Notebook(self.root)
@@ -215,7 +228,7 @@ class AndGateTesterApp:
         ttk.Label(conn_frame, text="主核心 COM").grid(row=1, column=0, sticky=tk.W)
         self.port_var = tk.StringVar()
         self.port_combo = ttk.Combobox(
-            conn_frame, textvariable=self.port_var, width=36, state="readonly"
+            conn_frame, textvariable=self.port_var, width=28, state="readonly"
         )
         self.port_combo.grid(row=1, column=1, padx=6, sticky=tk.EW)
         conn_frame.columnconfigure(1, weight=1)
@@ -223,7 +236,7 @@ class AndGateTesterApp:
         ttk.Label(conn_frame, text="副核心 COM").grid(row=2, column=0, sticky=tk.W, pady=(6, 0))
         self.slave_port_var = tk.StringVar()
         self.slave_port_combo = ttk.Combobox(
-            conn_frame, textvariable=self.slave_port_var, width=36, state="readonly"
+            conn_frame, textvariable=self.slave_port_var, width=28, state="readonly"
         )
         self.slave_port_combo.grid(row=2, column=1, padx=6, sticky=tk.EW, pady=(6, 0))
 
@@ -243,8 +256,17 @@ class AndGateTesterApp:
 
         self._on_conn_mode_change()
 
-        param_frame = ttk.LabelFrame(parent, text="信號產生 (D2/D3)", padding=8)
-        param_frame.pack(fill=tk.X, padx=6, pady=4)
+        body_frame = ttk.Frame(parent)
+        body_frame.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+
+        left_col = ttk.Frame(body_frame)
+        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 3), pady=4)
+
+        right_col = ttk.Frame(body_frame)
+        right_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(3, 6), pady=4)
+
+        param_frame = ttk.LabelFrame(left_col, text="信號產生 (D2/D3)", padding=8)
+        param_frame.pack(fill=tk.X, pady=(0, 4))
 
         ttk.Label(param_frame, text="頻率 (Hz)").grid(row=0, column=0, sticky=tk.W)
         self.freq_var = tk.StringVar(value=str(DEFAULT_FREQ_HZ))
@@ -263,10 +285,11 @@ class AndGateTesterApp:
             to=360,
             variable=self.phase_var,
             orient=tk.HORIZONTAL,
-            length=220,
+            length=200,
             command=self._on_phase_drag,
         )
         self.phase_scale.grid(row=1, column=1, columnspan=2, sticky=tk.EW, padx=6)
+        param_frame.columnconfigure(1, weight=1)
         self.phase_label = ttk.Label(param_frame, text="0°")
         self.phase_label.grid(row=1, column=3)
 
@@ -278,11 +301,11 @@ class AndGateTesterApp:
             side=tk.LEFT, padx=4
         )
 
-        io_frame = ttk.Frame(parent, padding=0)
-        io_frame.pack(fill=tk.X, padx=6, pady=4)
+        io_frame = ttk.Frame(left_col, padding=0)
+        io_frame.pack(fill=tk.BOTH, expand=True)
 
         in_frame = ttk.LabelFrame(io_frame, text="數位輸入 D5–D8（自動掃描）", padding=8)
-        in_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
+        in_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
         for pin in INPUT_PINS:
             row = ttk.Frame(in_frame)
             row.pack(fill=tk.X, pady=2)
@@ -292,7 +315,7 @@ class AndGateTesterApp:
             self._input_labels[pin] = lbl
 
         out_frame = ttk.LabelFrame(io_frame, text="主核心輸出 D9/D12/D13", padding=8)
-        out_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
+        out_frame.pack(side=tk.TOP, fill=tk.X)
         for pin in OUTPUT_PINS:
             row = ttk.Frame(out_frame)
             row.pack(fill=tk.X, pady=2)
@@ -309,8 +332,10 @@ class AndGateTesterApp:
             st.pack(side=tk.LEFT, padx=4)
             self._output_labels[pin] = st
 
-        slave_frame = ttk.LabelFrame(parent, text="副核心 Software Serial (D10/D11 → 9600 baud)", padding=8)
-        slave_frame.pack(fill=tk.X, padx=6, pady=4)
+        slave_frame = ttk.LabelFrame(
+            right_col, text="副核心 (Software Serial D10/D11 @ 9600)", padding=8
+        )
+        slave_frame.pack(fill=tk.BOTH, expand=True)
 
         ttk.Label(slave_frame, textvariable=self._slave_status_var, foreground="gray").pack(
             anchor=tk.W
@@ -318,22 +343,21 @@ class AndGateTesterApp:
 
         ss_btn_row = ttk.Frame(slave_frame)
         ss_btn_row.pack(fill=tk.X, pady=4)
-        ttk.Button(ss_btn_row, text="測試連線 PING", command=lambda: self._ss_ping()).pack(
+        ttk.Button(ss_btn_row, text="PING", command=lambda: self._ss_ping()).pack(
             side=tk.LEFT, padx=2
         )
-        ttk.Button(ss_btn_row, text="查詢狀態", command=lambda: self._ss_command("STATUS?")).pack(
+        ttk.Button(ss_btn_row, text="狀態", command=lambda: self._ss_command("STATUS?")).pack(
             side=tk.LEFT, padx=2
         )
-        ttk.Button(ss_btn_row, text="讀取輸入 IN?", command=lambda: self._ss_command("IN?")).pack(
+        ttk.Button(ss_btn_row, text="IN?", command=lambda: self._ss_command("IN?")).pack(
             side=tk.LEFT, padx=2
         )
-        ttk.Button(ss_btn_row, text="讀取輸出 OUT?", command=lambda: self._ss_command("OUT?")).pack(
+        ttk.Button(ss_btn_row, text="OUT?", command=lambda: self._ss_command("OUT?")).pack(
             side=tk.LEFT, padx=2
         )
 
-        ss_io = ttk.Frame(slave_frame)
+        ss_io = ttk.LabelFrame(slave_frame, text="副核心輸出 D9/D12/D13", padding=6)
         ss_io.pack(fill=tk.X, pady=4)
-        ttk.Label(ss_io, text="副核心輸出").pack(anchor=tk.W)
         for pin in SLAVE_OUTPUT_PINS:
             row = ttk.Frame(ss_io)
             row.pack(fill=tk.X, pady=2)
@@ -348,16 +372,32 @@ class AndGateTesterApp:
             lbl.pack(side=tk.LEFT, padx=4)
             self._slave_output_labels[pin] = lbl
 
-        ss_cmd_row = ttk.Frame(slave_frame)
-        ss_cmd_row.pack(fill=tk.X, pady=(6, 0))
-        ttk.Label(ss_cmd_row, text="自訂指令").pack(side=tk.LEFT)
-        self.ss_cmd_var = tk.StringVar()
-        ttk.Entry(ss_cmd_row, textvariable=self.ss_cmd_var, width=28).pack(
-            side=tk.LEFT, padx=6
-        )
-        ttk.Button(ss_cmd_row, text="送出", command=self._ss_send_custom).pack(side=tk.LEFT)
+        var_frame = ttk.LabelFrame(slave_frame, text="EEPROM 變數 (float A~E)", padding=6)
+        var_frame.pack(fill=tk.X, pady=(4, 0))
 
-        blink_frame = ttk.LabelFrame(slave_frame, text="副核心 D13 LED 閃爍", padding=6)
+        for row_idx, name in enumerate(SLAVE_VAR_NAMES):
+            label = "E (閃爍秒)" if name == "E" else name
+            ttk.Label(var_frame, text=label, width=8 if name == "E" else 2).grid(
+                row=row_idx, column=0, sticky=tk.W, padx=(0, 4), pady=2
+            )
+            ttk.Entry(var_frame, textvariable=self._slave_var_vars[name], width=12).grid(
+                row=row_idx, column=1, sticky=tk.EW, pady=2
+            )
+        var_frame.columnconfigure(1, weight=1)
+
+        var_btn_row = ttk.Frame(var_frame)
+        var_btn_row.grid(row=len(SLAVE_VAR_NAMES), column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        ttk.Button(var_btn_row, text="更新變數", command=self._update_slave_vars).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(var_btn_row, text="讀取變數", command=self._query_slave_vars).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Label(var_frame, textvariable=self._var_ack_var, foreground="gray", wraplength=280).grid(
+            row=len(SLAVE_VAR_NAMES) + 1, column=0, columnspan=2, sticky=tk.W, pady=(4, 0)
+        )
+
+        blink_frame = ttk.LabelFrame(slave_frame, text="D13 LED 閃爍", padding=6)
         blink_frame.pack(fill=tk.X, pady=(8, 0))
 
         ttk.Label(blink_frame, text="週期 (秒)").grid(row=0, column=0, sticky=tk.W)
@@ -368,7 +408,7 @@ class AndGateTesterApp:
             to=BLINK_MAX_SEC,
             variable=self.blink_period_var,
             orient=tk.HORIZONTAL,
-            length=220,
+            length=160,
             command=self._on_blink_drag,
         )
         self.blink_scale.grid(row=0, column=1, padx=6, sticky=tk.EW)
@@ -387,44 +427,50 @@ class AndGateTesterApp:
         self.blink_state_label = ttk.Label(blink_btn_row, text="未閃爍", foreground="gray")
         self.blink_state_label.pack(side=tk.LEFT, padx=8)
 
-        diag_frame = ttk.LabelFrame(
-            slave_frame, text="Software Serial 接收字元檢查（副核心 D10 RX）", padding=6
+        ss_cmd_row = ttk.Frame(slave_frame)
+        ss_cmd_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(ss_cmd_row, text="自訂 SS").pack(side=tk.LEFT)
+        self.ss_cmd_var = tk.StringVar()
+        ttk.Entry(ss_cmd_row, textvariable=self.ss_cmd_var, width=16).pack(
+            side=tk.LEFT, padx=6, fill=tk.X, expand=True
         )
+        ttk.Button(ss_cmd_row, text="送出", command=self._ss_send_custom).pack(side=tk.LEFT)
+
+        diag_frame = ttk.LabelFrame(slave_frame, text="SS 接收字元檢查 (D10 RX)", padding=6)
         diag_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
 
         diag_hint = ttk.Label(
             diag_frame,
-            text="組合型：副核心 USB 監聽 SSRXC（逐字元）/ SSRX（完整指令）。"
-            "主 D11→副 D10、主 D10←副 D11、共地。",
+            text="組合型監聽 COM6：SSRXC / SSRX / VARACK",
             foreground="gray",
-            wraplength=480,
+            wraplength=300,
         )
         diag_hint.pack(anchor=tk.W, pady=(0, 4))
 
-        self.ss_rx_text = tk.Text(diag_frame, height=7, state=tk.DISABLED, font=("Consolas", 9))
+        self.ss_rx_text = tk.Text(diag_frame, height=6, state=tk.DISABLED, font=("Consolas", 9))
         self.ss_rx_text.pack(fill=tk.BOTH, expand=True, pady=4)
 
         diag_btn_row = ttk.Frame(diag_frame)
         diag_btn_row.pack(fill=tk.X)
-        ttk.Button(diag_btn_row, text="執行組合診斷", command=self._run_combined_diag).pack(
+        ttk.Button(diag_btn_row, text="組合診斷", command=self._run_combined_diag).pack(
             side=tk.LEFT, padx=2
         )
-        ttk.Button(diag_btn_row, text="副核心直連 PING", command=self._slave_direct_ping).pack(
+        ttk.Button(diag_btn_row, text="直連 PING", command=self._slave_direct_ping).pack(
             side=tk.LEFT, padx=2
         )
-        ttk.Button(diag_btn_row, text="查詢 SSRX?", command=self._query_ssrx).pack(
+        ttk.Button(diag_btn_row, text="SSRX?", command=self._query_ssrx).pack(
             side=tk.LEFT, padx=2
         )
-        ttk.Button(diag_btn_row, text="查詢 SSDIAG?", command=self._query_ssdiag).pack(
+        ttk.Button(diag_btn_row, text="SSDIAG?", command=self._query_ssdiag).pack(
             side=tk.LEFT, padx=2
         )
-        ttk.Button(diag_btn_row, text="清除 SS 監視", command=self._clear_ss_rx_log).pack(
+        ttk.Button(diag_btn_row, text="清除", command=self._clear_ss_rx_log).pack(
             side=tk.LEFT, padx=2
         )
         self.ss_diag_summary_var = tk.StringVar(value="尚未執行診斷")
-        ttk.Label(diag_frame, textvariable=self.ss_diag_summary_var, foreground="gray").pack(
-            anchor=tk.W, pady=(4, 0)
-        )
+        ttk.Label(
+            diag_frame, textvariable=self.ss_diag_summary_var, foreground="gray", wraplength=300
+        ).pack(anchor=tk.W, pady=(4, 0))
 
         status_frame = ttk.LabelFrame(parent, text="狀態 / 日誌", padding=8)
         status_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
@@ -432,7 +478,7 @@ class AndGateTesterApp:
         self.status_var = tk.StringVar(value="未連線")
         ttk.Label(status_frame, textvariable=self.status_var).pack(anchor=tk.W)
 
-        self.log_text = tk.Text(status_frame, height=8, state=tk.DISABLED)
+        self.log_text = tk.Text(status_frame, height=6, state=tk.DISABLED)
         self.log_text.pack(fill=tk.BOTH, expand=True, pady=4)
 
     def _build_docs_tab(self, parent: ttk.Frame) -> None:
@@ -455,6 +501,122 @@ class AndGateTesterApp:
         self.ss_rx_text.insert(tk.END, message + "\n")
         self.ss_rx_text.see(tk.END)
         self.ss_rx_text.configure(state=tk.DISABLED)
+        if message.startswith("< "):
+            line = message[2:].strip()
+        else:
+            line = message
+        if line.startswith("VARACK:"):
+            self._apply_var_payload(line[7:])
+
+    def _apply_var_payload(self, payload: str) -> None:
+        values = self._parse_var_payload(payload)
+        if not values:
+            return
+        for name, val in values.items():
+            self._slave_var_vars[name].set(f"{val:g}")
+        if "E" in values:
+            self._set_blink_ui_from_e(values["E"])
+        self._var_ack_var.set(f"COM6 確認：{payload}")
+
+    @staticmethod
+    def _parse_var_payload(payload: str) -> Dict[str, float]:
+        values: Dict[str, float] = {}
+        for name, raw in VAR_LINE_RE.findall(payload):
+            try:
+                values[name] = float(raw)
+            except ValueError:
+                continue
+        return values
+
+    def _read_slave_var_fields(self) -> Optional[str]:
+        parts: List[str] = []
+        for name in SLAVE_VAR_NAMES:
+            raw = self._slave_var_vars[name].get().strip()
+            if not raw:
+                messagebox.showwarning("EEPROM 變數", f"變數 {name} 不可為空")
+                return None
+            try:
+                parts.append(f"{float(raw):g}")
+            except ValueError:
+                messagebox.showwarning("EEPROM 變數", f"變數 {name} 請輸入有效數字")
+                return None
+        return ",".join(parts)
+
+    def _send_svar(self, subcmd: str, log: bool = True) -> str:
+        if subcmd == "?":
+            resp = self._send_command("SVAR?", log=log)
+        else:
+            resp = self._send_command(f"SVAR:{subcmd}", log=log)
+        if resp.startswith("SSR:"):
+            slave_resp = resp[4:]
+            self._slave_status_var.set(f"副核心：{slave_resp}")
+            if slave_resp.startswith("VAR:"):
+                self._apply_var_payload(slave_resp[4:])
+            return slave_resp
+        if resp.startswith("ERR"):
+            self._slave_status_var.set(resp)
+        return resp
+
+    def _wait_var_ack_on_com6(self) -> Optional[str]:
+        if not self._slave_serial or not self._slave_serial.is_open:
+            return None
+        deadline = time.time() + (VAR_ACK_WAIT_MS / 1000.0)
+        while time.time() < deadline:
+            for line in self._drain_slave_serial():
+                if line.startswith("VARACK:"):
+                    return line
+            time.sleep(0.05)
+        return None
+
+    def _update_slave_vars(self) -> None:
+        payload = self._read_slave_var_fields()
+        if payload is None:
+            return
+        try:
+            if self.conn_mode_var.get() == "combo" and (
+                not self._slave_serial or not self._slave_serial.is_open
+            ):
+                self._start_slave_monitor(auto=True)
+
+            resp = self._send_svar(f"ALL:{payload}")
+            if resp != "OK":
+                messagebox.showwarning("EEPROM 變數", resp or "更新失敗")
+                return
+
+            try:
+                e_sec = float(self._slave_var_vars["E"].get())
+                if e_sec > 0:
+                    self._set_blink_ui_from_e(e_sec)
+                    self._blink_running = True
+                    self._last_blink_ms = self._period_sec_to_ms(e_sec)
+                    self.blink_state_label.configure(
+                        text=f"閃爍中 {e_sec:.1f}s", foreground="green"
+                    )
+                    lbl = self._slave_output_labels[13]
+                    lbl.configure(text="BLINK", foreground="green")
+            except ValueError:
+                pass
+
+            ack = self._wait_var_ack_on_com6()
+            if ack:
+                self._var_ack_var.set(f"COM6 確認：{ack[7:]}")
+                self._log(f"< {ack}")
+            elif self.conn_mode_var.get() == "combo":
+                self._var_ack_var.set("主核心 OK，但未收到 COM6 VARACK")
+            else:
+                self._var_ack_var.set("主核心已更新（組合型可監聽 COM6 VARACK）")
+        except RuntimeError as exc:
+            messagebox.showwarning("連線", str(exc))
+
+    def _query_slave_vars(self) -> None:
+        try:
+            resp = self._send_svar("?")
+            if resp.startswith("VAR:"):
+                self._apply_var_payload(resp[4:])
+            elif resp.startswith("ERR"):
+                messagebox.showwarning("EEPROM 變數", resp)
+        except RuntimeError as exc:
+            messagebox.showwarning("連線", str(exc))
 
     def _clear_ss_rx_log(self) -> None:
         self.ss_rx_text.configure(state=tk.NORMAL)
@@ -566,8 +728,11 @@ class AndGateTesterApp:
             self._port_scan_job = None
 
     def _port_scan_tick(self) -> None:
-        self._refresh_ports()
-        self._port_scan_job = self.root.after(PORT_SCAN_MS, self._port_scan_tick)
+        if not self._closing:
+            self._refresh_ports()
+            self._port_scan_job = self.root.after(PORT_SCAN_MS, self._port_scan_tick)
+        else:
+            self._port_scan_job = None
 
     def _toggle_connection(self) -> None:
         if self._serial and self._serial.is_open:
@@ -602,6 +767,8 @@ class AndGateTesterApp:
             self._serial = None
 
     def _disconnect(self) -> None:
+        if self._closing:
+            return
         self._stop_io_scan()
         self._stop_slave_monitor()
         self._cancel_phase_apply()
@@ -609,17 +776,60 @@ class AndGateTesterApp:
         self._last_applied_phase = None
         self._last_blink_ms = None
         self._blink_running = False
-        if self._serial:
-            try:
-                self._send_command("STOP", log=False)
-            except OSError:
-                pass
-            self._serial.close()
-            self._serial = None
+        self._close_main_serial(send_stop=True)
         self.connect_btn.configure(text="連線")
         self.status_var.set("未連線")
         self._log("已斷線")
         self._reset_io_display()
+
+    def _close_main_serial(self, send_stop: bool = False) -> None:
+        ser = self._serial
+        if ser is None:
+            return
+        self._serial = None
+        try:
+            if send_stop and ser.is_open:
+                ser.write(b"STOP\n")
+                ser.flush()
+        except OSError:
+            pass
+        try:
+            if ser.is_open:
+                ser.close()
+        except OSError:
+            pass
+
+    def _close_slave_serial(self) -> None:
+        if self._slave_monitor_job is not None:
+            try:
+                self.root.after_cancel(self._slave_monitor_job)
+            except tk.TclError:
+                pass
+            self._slave_monitor_job = None
+        ser = self._slave_serial
+        if ser is None:
+            return
+        self._slave_serial = None
+        try:
+            if ser.is_open:
+                ser.close()
+        except OSError:
+            pass
+
+    def _release_all_ports(self) -> None:
+        self._stop_port_scan()
+        self._stop_io_scan()
+        self._cancel_phase_apply()
+        self._cancel_blink_apply()
+        self._close_slave_serial()
+        self._close_main_serial(send_stop=False)
+
+    def _atexit_release_ports(self) -> None:
+        self._closing = True
+        try:
+            self._release_all_ports()
+        except Exception:
+            pass
 
     def _reset_io_display(self) -> None:
         for pin in INPUT_PINS:
@@ -632,6 +842,7 @@ class AndGateTesterApp:
             self._slave_output_labels[pin].configure(text="—", foreground="gray")
         self.blink_state_label.configure(text="未閃爍", foreground="gray")
         self.ss_diag_summary_var.set("尚未執行診斷")
+        self._var_ack_var.set("尚未更新 EEPROM 變數")
 
     def _toggle_slave_monitor(self) -> None:
         if self._slave_serial and self._slave_serial.is_open:
@@ -665,27 +876,23 @@ class AndGateTesterApp:
                 messagebox.showerror("副核心監聽失敗", str(exc))
 
     def _stop_slave_monitor(self) -> None:
-        if self._slave_monitor_job is not None:
-            self.root.after_cancel(self._slave_monitor_job)
-            self._slave_monitor_job = None
-        if self._slave_serial:
-            try:
-                self._slave_serial.close()
-            except OSError:
-                pass
-            self._slave_serial = None
-        self.slave_monitor_btn.configure(text="監聽副核心")
+        self._close_slave_serial()
+        if not self._closing:
+            self.slave_monitor_btn.configure(text="監聽副核心")
 
     def _start_slave_monitor_tick(self) -> None:
         self._slave_monitor_tick()
 
     def _slave_monitor_tick(self) -> None:
-        if self._slave_serial and self._slave_serial.is_open:
+        if not self._closing and self._slave_serial and self._slave_serial.is_open:
             try:
                 self._drain_slave_serial()
             except OSError:
                 pass
-        self._slave_monitor_job = self.root.after(SLAVE_MONITOR_MS, self._slave_monitor_tick)
+        if not self._closing:
+            self._slave_monitor_job = self.root.after(SLAVE_MONITOR_MS, self._slave_monitor_tick)
+        else:
+            self._slave_monitor_job = None
 
     def _drain_slave_serial(self) -> List[str]:
         lines: List[str] = []
@@ -712,7 +919,7 @@ class AndGateTesterApp:
         while time.time() < deadline:
             lines = self._drain_slave_serial()
             for line in lines:
-                if line.startswith(("PONG", "OK", "ERR", "SSRX:", "SLAVE:", "OUT:", "IN:")):
+                if line.startswith(("PONG", "OK", "ERR", "SSRX:", "SLAVE:", "OUT:", "IN:", "VAR:", "VARACK:")):
                     return line
             time.sleep(0.05)
         return ""
@@ -857,7 +1064,7 @@ class AndGateTesterApp:
             self._poll_job = None
 
     def _io_scan_tick(self) -> None:
-        if self._serial and self._serial.is_open:
+        if not self._closing and self._serial and self._serial.is_open:
             try:
                 in_resp = self._send_command("IN?", log=False)
                 for pin, val in self._parse_pin_values(in_resp).items():
@@ -871,7 +1078,10 @@ class AndGateTesterApp:
                         self._refresh_output_label(pin)
             except (RuntimeError, OSError):
                 pass
-        self._poll_job = self.root.after(POLL_MS, self._io_scan_tick)
+        if not self._closing:
+            self._poll_job = self.root.after(POLL_MS, self._io_scan_tick)
+        else:
+            self._poll_job = None
 
     def _update_input_label(self, pin: int, value: int) -> None:
         lbl = self._input_labels[pin]
@@ -965,10 +1175,20 @@ class AndGateTesterApp:
         clamped = max(BLINK_MIN_SEC, min(BLINK_MAX_SEC, sec))
         return int(round(clamped * 1000))
 
+    def _set_blink_ui_from_e(self, sec: float) -> None:
+        sec = max(BLINK_MIN_SEC, min(BLINK_MAX_SEC, sec))
+        self.blink_period_var.set(sec)
+        self.blink_period_label.configure(text=f"{sec:.1f} s")
+
+    def _set_e_from_blink_sec(self, sec: float) -> None:
+        sec = max(BLINK_MIN_SEC, min(BLINK_MAX_SEC, sec))
+        self._slave_var_vars["E"].set(f"{sec:g}")
+
     def _on_blink_drag(self, _value: str) -> None:
         sec = float(self.blink_period_var.get())
         sec = max(BLINK_MIN_SEC, min(BLINK_MAX_SEC, sec))
         self.blink_period_label.configure(text=f"{sec:.1f} s")
+        self._set_e_from_blink_sec(sec)
         if self._blink_running and self._serial and self._serial.is_open:
             self._schedule_blink_apply(sec)
 
@@ -992,12 +1212,15 @@ class AndGateTesterApp:
             resp = self._send_ss_command(f"BLINK:{period_ms}", log=False)
             if resp == "OK":
                 self._last_blink_ms = period_ms
+                self._set_e_from_blink_sec(sec)
                 self.blink_state_label.configure(text=f"閃爍中 {sec:.1f}s", foreground="green")
         except (RuntimeError, OSError):
             pass
 
     def _start_blink(self) -> None:
         sec = float(self.blink_period_var.get())
+        sec = max(BLINK_MIN_SEC, min(BLINK_MAX_SEC, sec))
+        self._set_e_from_blink_sec(sec)
         period_ms = self._period_sec_to_ms(sec)
         try:
             resp = self._send_ss_command(f"BLINK:{period_ms}")
@@ -1105,9 +1328,8 @@ class AndGateTesterApp:
             messagebox.showwarning("連線", str(exc))
 
     def on_close(self) -> None:
-        self._stop_port_scan()
-        self._stop_slave_monitor()
-        self._disconnect()
+        self._closing = True
+        self._release_all_ports()
         self.root.destroy()
 
 
