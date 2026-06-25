@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.env
+.venv/
+venv/
+
+# arduino-cli 本機工具（請依 DEVELOPMENT.md 自行下載）
+tools/arduino-cli/arduino-cli.exe
+tools/arduino-cli/arduino-cli.zip
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
