@@ -10,8 +10,11 @@ def _configure_frozen_tcl_tk() -> None:
     """Set Tcl/Tk library paths when running as PyInstaller onefile."""
     if getattr(sys, "frozen", False):
         base = sys._MEIPASS
-        os.environ.setdefault("TCL_LIBRARY", os.path.join(base, "tcl", "tcl8.6"))
-        os.environ.setdefault("TK_LIBRARY", os.path.join(base, "tk", "tk8.6"))
+        os.environ["PATH"] = base + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(base)
+        os.environ["TCL_LIBRARY"] = os.path.join(base, "tcl", "tcl8.6")
+        os.environ["TK_LIBRARY"] = os.path.join(base, "tk", "tk8.6")
 
 
 _configure_frozen_tcl_tk()

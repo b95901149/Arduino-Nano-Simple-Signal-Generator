@@ -14,6 +14,7 @@ $condaLib = "C:\ProgramData\anaconda3\Library"
     --distpath release `
     --workpath build `
     --specpath build `
+    --runtime-hook "$root\scripts\pyi_rth_dll_path.py" `
     --paths "$condaLib\bin" `
     --add-binary "$condaLib\bin\tcl86t.dll;." `
     --add-binary "$condaLib\bin\tk86t.dll;." `
