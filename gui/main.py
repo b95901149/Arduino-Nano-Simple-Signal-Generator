@@ -20,6 +20,7 @@ def _configure_frozen_tcl_tk() -> None:
 _configure_frozen_tcl_tk()
 
 import re
+import time
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 from typing import Dict, List, Optional, Tuple
@@ -32,10 +33,16 @@ DEFAULT_FREQ_HZ = 20000
 DEFAULT_PHASE_DEG = 0
 BAUD_RATE = 115200
 INPUT_PINS = (5, 6, 7, 8)
-OUTPUT_PINS = (9, 10, 11, 12, 13)
+OUTPUT_PINS = (9, 12, 13)
+SLAVE_OUTPUT_PINS = (9, 12, 13)
 POLL_MS = 250
-PHASE_DEBOUNCE_MS = 40
 PORT_SCAN_MS = 1500
+SLAVE_MONITOR_MS = 50
+PHASE_DEBOUNCE_MS = 40
+BLINK_DEBOUNCE_MS = 80
+BLINK_MIN_SEC = 0.1
+BLINK_MAX_SEC = 5.0
+BLINK_DEFAULT_SEC = 1.0
 
 ARDUINO_PORT_HINTS = ("ch340", "arduino", "usb-serial", "ftdi", "cp210", "wch")
 
@@ -52,7 +59,13 @@ DOCS_TEXT = """\
   D2      信號 A（方波輸出）
   D3      信號 B（方波輸出，可調相位）
   D5–D8   數位輸入（自動掃描顯示 HIGH / LOW）
-  D9–D13  數位輸出（面板點擊 HIGH / LOW 控制）
+  D9/D12/D13  主核心數位輸出
+  D10/D11 SoftwareSerial 9600 → 副核心 Arduino
+
+【副核心接線（Software Serial）】
+  主 D11 (TX) ──► 副 D10 (RX)
+  主 D10 (RX) ◄── 副 D11 (TX)
+  GND 共地
 
 【快速操作】
   1. 啟動 GUI，程式會自動掃描 COM 埠
@@ -60,7 +73,8 @@ DOCS_TEXT = """\
   3. 設定頻率（預設 20000 Hz）→ 按「套用頻率」
   4. 按「開始輸出」產生 D2/D3 方波
   5. 拖動相位滑桿可即時調整兩通道相位差
-  6. D5–D8 輸入狀態自動更新；D9–D13 可手動切換輸出
+  6. D5–D8 輸入狀態自動更新；D9/D12/D13 可手動切換輸出
+  7. 「副核心」區塊透過 D10/D11 控制另一片 Arduino
 
 【AND 閘測試接線】
   Nano D2 ──► AND 輸入 A
@@ -123,8 +137,14 @@ DOCS_TEXT = """\
   START / STOP    開始 / 停止方波輸出
   STATUS?         查詢波形狀態
   IN?             讀取 D5–D8 輸入
-  OUT:<pin>:<0|1> 設定 D9–D13 輸出
-  OUT?            查詢 D9–D13 輸出狀態
+  OUT:<pin>:<0|1> 設定 D9/D12/D13 輸出
+  OUT?            查詢 D9/D12/D13 輸出狀態
+  SS:<cmd>        轉送指令至副核心（回應 SSR:...）
+  SSDIAG?         查詢主核心 SoftwareSerial 狀態
+
+【組合型診斷】
+  同時連線主核心 USB + 副核心 USB，監看副核心 SSRXC/SSRX 行
+  以確認 D10/D11 交叉接線與 9600 baud 通訊是否正常
 """
 
 
@@ -134,17 +154,24 @@ class AndGateTesterApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Arduino Nano Simple Signal Generator")
-        self.root.minsize(540, 600)
+        self.root.minsize(540, 720)
 
         self._serial: Optional[serial.Serial] = None
+        self._slave_serial: Optional[serial.Serial] = None
         self._poll_job: Optional[str] = None
         self._port_scan_job: Optional[str] = None
+        self._slave_monitor_job: Optional[str] = None
         self._phase_job: Optional[str] = None
         self._last_applied_phase: Optional[int] = None
         self._known_ports: List[str] = []
         self._output_state: Dict[int, int] = {pin: 0 for pin in OUTPUT_PINS}
         self._output_labels: Dict[int, ttk.Label] = {}
         self._input_labels: Dict[int, ttk.Label] = {}
+        self._slave_output_labels: Dict[int, ttk.Label] = {}
+        self._slave_status_var = tk.StringVar(value="未連線副核心")
+        self._blink_job: Optional[str] = None
+        self._last_blink_ms: Optional[int] = None
+        self._blink_running = False
 
         self._build_ui()
         self._refresh_ports()
@@ -166,23 +193,55 @@ class AndGateTesterApp:
         conn_frame = ttk.LabelFrame(parent, text="連線（COM 埠自動掃描）", padding=8)
         conn_frame.pack(fill=tk.X, padx=6, pady=6)
 
-        ttk.Label(conn_frame, text="COM 埠").grid(row=0, column=0, sticky=tk.W)
+        mode_row = ttk.Frame(conn_frame)
+        mode_row.grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 6))
+        ttk.Label(mode_row, text="連線模式").pack(side=tk.LEFT)
+        self.conn_mode_var = tk.StringVar(value="single")
+        ttk.Radiobutton(
+            mode_row,
+            text="僅主核心",
+            variable=self.conn_mode_var,
+            value="single",
+            command=self._on_conn_mode_change,
+        ).pack(side=tk.LEFT, padx=(8, 4))
+        ttk.Radiobutton(
+            mode_row,
+            text="組合型（主 + 副 USB）",
+            variable=self.conn_mode_var,
+            value="combo",
+            command=self._on_conn_mode_change,
+        ).pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(conn_frame, text="主核心 COM").grid(row=1, column=0, sticky=tk.W)
         self.port_var = tk.StringVar()
         self.port_combo = ttk.Combobox(
             conn_frame, textvariable=self.port_var, width=36, state="readonly"
         )
-        self.port_combo.grid(row=0, column=1, padx=6, sticky=tk.EW)
+        self.port_combo.grid(row=1, column=1, padx=6, sticky=tk.EW)
         conn_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(conn_frame, text="副核心 COM").grid(row=2, column=0, sticky=tk.W, pady=(6, 0))
+        self.slave_port_var = tk.StringVar()
+        self.slave_port_combo = ttk.Combobox(
+            conn_frame, textvariable=self.slave_port_var, width=36, state="readonly"
+        )
+        self.slave_port_combo.grid(row=2, column=1, padx=6, sticky=tk.EW, pady=(6, 0))
 
         self.scan_status_var = tk.StringVar(value="掃描中…")
         ttk.Label(conn_frame, textvariable=self.scan_status_var, foreground="gray").grid(
-            row=1, column=0, columnspan=2, sticky=tk.W, pady=(4, 0)
+            row=3, column=0, columnspan=2, sticky=tk.W, pady=(4, 0)
         )
 
         btn_row = ttk.Frame(conn_frame)
-        btn_row.grid(row=0, column=2, rowspan=2, padx=4)
+        btn_row.grid(row=1, column=2, rowspan=3, padx=4)
         self.connect_btn = ttk.Button(btn_row, text="連線", command=self._toggle_connection)
         self.connect_btn.pack(pady=2)
+        self.slave_monitor_btn = ttk.Button(
+            btn_row, text="監聽副核心", command=self._toggle_slave_monitor, state=tk.DISABLED
+        )
+        self.slave_monitor_btn.pack(pady=2)
+
+        self._on_conn_mode_change()
 
         param_frame = ttk.LabelFrame(parent, text="信號產生 (D2/D3)", padding=8)
         param_frame.pack(fill=tk.X, padx=6, pady=4)
@@ -232,7 +291,7 @@ class AndGateTesterApp:
             lbl.pack(side=tk.LEFT, padx=4)
             self._input_labels[pin] = lbl
 
-        out_frame = ttk.LabelFrame(io_frame, text="數位輸出 D9–D13（自動同步）", padding=8)
+        out_frame = ttk.LabelFrame(io_frame, text="主核心輸出 D9/D12/D13", padding=8)
         out_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
         for pin in OUTPUT_PINS:
             row = ttk.Frame(out_frame)
@@ -249,6 +308,123 @@ class AndGateTesterApp:
             st = ttk.Label(row, text="—", width=6, anchor=tk.CENTER)
             st.pack(side=tk.LEFT, padx=4)
             self._output_labels[pin] = st
+
+        slave_frame = ttk.LabelFrame(parent, text="副核心 Software Serial (D10/D11 → 9600 baud)", padding=8)
+        slave_frame.pack(fill=tk.X, padx=6, pady=4)
+
+        ttk.Label(slave_frame, textvariable=self._slave_status_var, foreground="gray").pack(
+            anchor=tk.W
+        )
+
+        ss_btn_row = ttk.Frame(slave_frame)
+        ss_btn_row.pack(fill=tk.X, pady=4)
+        ttk.Button(ss_btn_row, text="測試連線 PING", command=lambda: self._ss_ping()).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(ss_btn_row, text="查詢狀態", command=lambda: self._ss_command("STATUS?")).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(ss_btn_row, text="讀取輸入 IN?", command=lambda: self._ss_command("IN?")).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(ss_btn_row, text="讀取輸出 OUT?", command=lambda: self._ss_command("OUT?")).pack(
+            side=tk.LEFT, padx=2
+        )
+
+        ss_io = ttk.Frame(slave_frame)
+        ss_io.pack(fill=tk.X, pady=4)
+        ttk.Label(ss_io, text="副核心輸出").pack(anchor=tk.W)
+        for pin in SLAVE_OUTPUT_PINS:
+            row = ttk.Frame(ss_io)
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text=f"D{pin}", width=4).pack(side=tk.LEFT)
+            ttk.Button(
+                row, text="HIGH", width=6, command=lambda p=pin: self._ss_set_output(p, 1)
+            ).pack(side=tk.LEFT, padx=2)
+            ttk.Button(
+                row, text="LOW", width=6, command=lambda p=pin: self._ss_set_output(p, 0)
+            ).pack(side=tk.LEFT, padx=2)
+            lbl = ttk.Label(row, text="—", width=6, anchor=tk.CENTER)
+            lbl.pack(side=tk.LEFT, padx=4)
+            self._slave_output_labels[pin] = lbl
+
+        ss_cmd_row = ttk.Frame(slave_frame)
+        ss_cmd_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(ss_cmd_row, text="自訂指令").pack(side=tk.LEFT)
+        self.ss_cmd_var = tk.StringVar()
+        ttk.Entry(ss_cmd_row, textvariable=self.ss_cmd_var, width=28).pack(
+            side=tk.LEFT, padx=6
+        )
+        ttk.Button(ss_cmd_row, text="送出", command=self._ss_send_custom).pack(side=tk.LEFT)
+
+        blink_frame = ttk.LabelFrame(slave_frame, text="副核心 D13 LED 閃爍", padding=6)
+        blink_frame.pack(fill=tk.X, pady=(8, 0))
+
+        ttk.Label(blink_frame, text="週期 (秒)").grid(row=0, column=0, sticky=tk.W)
+        self.blink_period_var = tk.DoubleVar(value=BLINK_DEFAULT_SEC)
+        self.blink_scale = ttk.Scale(
+            blink_frame,
+            from_=BLINK_MIN_SEC,
+            to=BLINK_MAX_SEC,
+            variable=self.blink_period_var,
+            orient=tk.HORIZONTAL,
+            length=220,
+            command=self._on_blink_drag,
+        )
+        self.blink_scale.grid(row=0, column=1, padx=6, sticky=tk.EW)
+        blink_frame.columnconfigure(1, weight=1)
+        self.blink_period_label = ttk.Label(blink_frame, text="1.0 s")
+        self.blink_period_label.grid(row=0, column=2, padx=4)
+
+        blink_btn_row = ttk.Frame(blink_frame)
+        blink_btn_row.grid(row=1, column=0, columnspan=3, pady=(6, 0), sticky=tk.W)
+        ttk.Button(blink_btn_row, text="開始閃爍", command=self._start_blink).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(blink_btn_row, text="停止閃爍", command=self._stop_blink).pack(
+            side=tk.LEFT, padx=2
+        )
+        self.blink_state_label = ttk.Label(blink_btn_row, text="未閃爍", foreground="gray")
+        self.blink_state_label.pack(side=tk.LEFT, padx=8)
+
+        diag_frame = ttk.LabelFrame(
+            slave_frame, text="Software Serial 接收字元檢查（副核心 D10 RX）", padding=6
+        )
+        diag_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        diag_hint = ttk.Label(
+            diag_frame,
+            text="組合型：副核心 USB 監聽 SSRXC（逐字元）/ SSRX（完整指令）。"
+            "主 D11→副 D10、主 D10←副 D11、共地。",
+            foreground="gray",
+            wraplength=480,
+        )
+        diag_hint.pack(anchor=tk.W, pady=(0, 4))
+
+        self.ss_rx_text = tk.Text(diag_frame, height=7, state=tk.DISABLED, font=("Consolas", 9))
+        self.ss_rx_text.pack(fill=tk.BOTH, expand=True, pady=4)
+
+        diag_btn_row = ttk.Frame(diag_frame)
+        diag_btn_row.pack(fill=tk.X)
+        ttk.Button(diag_btn_row, text="執行組合診斷", command=self._run_combined_diag).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(diag_btn_row, text="副核心直連 PING", command=self._slave_direct_ping).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(diag_btn_row, text="查詢 SSRX?", command=self._query_ssrx).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(diag_btn_row, text="查詢 SSDIAG?", command=self._query_ssdiag).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(diag_btn_row, text="清除 SS 監視", command=self._clear_ss_rx_log).pack(
+            side=tk.LEFT, padx=2
+        )
+        self.ss_diag_summary_var = tk.StringVar(value="尚未執行診斷")
+        ttk.Label(diag_frame, textvariable=self.ss_diag_summary_var, foreground="gray").pack(
+            anchor=tk.W, pady=(4, 0)
+        )
 
         status_frame = ttk.LabelFrame(parent, text="狀態 / 日誌", padding=8)
         status_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
@@ -273,6 +449,42 @@ class AndGateTesterApp:
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
+
+    def _append_ss_rx_log(self, message: str) -> None:
+        self.ss_rx_text.configure(state=tk.NORMAL)
+        self.ss_rx_text.insert(tk.END, message + "\n")
+        self.ss_rx_text.see(tk.END)
+        self.ss_rx_text.configure(state=tk.DISABLED)
+
+    def _clear_ss_rx_log(self) -> None:
+        self.ss_rx_text.configure(state=tk.NORMAL)
+        self.ss_rx_text.delete("1.0", tk.END)
+        self.ss_rx_text.configure(state=tk.DISABLED)
+
+    def _on_conn_mode_change(self) -> None:
+        combo = self.conn_mode_var.get() == "combo"
+        state = "readonly" if combo else tk.DISABLED
+        self.slave_port_combo.configure(state=state)
+        if combo:
+            self.slave_monitor_btn.configure(state=tk.NORMAL)
+        else:
+            self.slave_monitor_btn.configure(state=tk.DISABLED)
+            self._stop_slave_monitor()
+
+    @staticmethod
+    def _pick_slave_port(
+        ports: List[Tuple[str, str]], main_label: Optional[str]
+    ) -> Optional[str]:
+        main_device = ""
+        if main_label:
+            main_device = main_label.split()[0]
+        candidates = [
+            label for device, label in ports if device != main_device
+        ]
+        for label in candidates:
+            if AndGateTesterApp._is_arduino_like(label):
+                return label
+        return candidates[0] if candidates else None
 
     @staticmethod
     def _enumerate_ports() -> List[Tuple[str, str]]:
@@ -307,9 +519,12 @@ class AndGateTesterApp:
         changed = labels != self._known_ports
         self._known_ports = labels
         self.port_combo["values"] = labels
+        self.slave_port_combo["values"] = labels
 
         current = self.port_var.get()
         current_device = self._device_from_display(current)
+        slave_current = self.slave_port_var.get()
+        slave_device = self._device_from_display(slave_current)
 
         if current_device and current_device not in devices:
             if self._serial and self._serial.is_open:
@@ -320,6 +535,16 @@ class AndGateTesterApp:
             picked = self._pick_default_port(ports)
             if picked:
                 self.port_var.set(picked)
+
+        if slave_device and slave_device not in devices:
+            if self._slave_serial and self._slave_serial.is_open:
+                self._append_ss_rx_log(f"[系統] 副核心 COM {slave_device} 已消失，停止監聽")
+                self._stop_slave_monitor()
+            self.slave_port_var.set("")
+        elif not slave_current and labels and self.conn_mode_var.get() == "combo":
+            picked_slave = self._pick_slave_port(ports, self.port_var.get())
+            if picked_slave:
+                self.slave_port_var.set(picked_slave)
 
         count = len(labels)
         arduino_count = sum(1 for label in labels if self._is_arduino_like(label))
@@ -370,14 +595,20 @@ class AndGateTesterApp:
             self._sync_io_state()
             self._last_applied_phase = int(self.phase_var.get())
             self._start_io_scan()
+            if self.conn_mode_var.get() == "combo":
+                self._start_slave_monitor(auto=True)
         except serial.SerialException as exc:
             messagebox.showerror("連線失敗", str(exc))
             self._serial = None
 
     def _disconnect(self) -> None:
         self._stop_io_scan()
+        self._stop_slave_monitor()
         self._cancel_phase_apply()
+        self._cancel_blink_apply()
         self._last_applied_phase = None
+        self._last_blink_ms = None
+        self._blink_running = False
         if self._serial:
             try:
                 self._send_command("STOP", log=False)
@@ -396,6 +627,187 @@ class AndGateTesterApp:
         for pin in OUTPUT_PINS:
             self._output_state[pin] = 0
             self._refresh_output_label(pin)
+        self._slave_status_var.set("未連線副核心")
+        for pin in SLAVE_OUTPUT_PINS:
+            self._slave_output_labels[pin].configure(text="—", foreground="gray")
+        self.blink_state_label.configure(text="未閃爍", foreground="gray")
+        self.ss_diag_summary_var.set("尚未執行診斷")
+
+    def _toggle_slave_monitor(self) -> None:
+        if self._slave_serial and self._slave_serial.is_open:
+            self._stop_slave_monitor()
+        else:
+            self._start_slave_monitor(auto=False)
+
+    def _start_slave_monitor(self, auto: bool = False) -> None:
+        if self.conn_mode_var.get() != "combo":
+            return
+        port = self._device_from_display(self.slave_port_var.get())
+        main_port = self._device_from_display(self.port_var.get())
+        if not port:
+            if not auto:
+                messagebox.showwarning("副核心監聽", "請選擇副核心 COM 埠")
+            return
+        if port == main_port:
+            if not auto:
+                messagebox.showwarning("副核心監聽", "副核心 COM 不可與主核心相同")
+            return
+        try:
+            self._slave_serial = serial.Serial(port, BAUD_RATE, timeout=0.05)
+            self.slave_monitor_btn.configure(text="停止監聽")
+            self._append_ss_rx_log(f"[系統] 開始監聽 {port} @ {BAUD_RATE}")
+            time.sleep(0.15)
+            self._drain_slave_serial()
+            self._start_slave_monitor_tick()
+        except serial.SerialException as exc:
+            self._slave_serial = None
+            if not auto:
+                messagebox.showerror("副核心監聽失敗", str(exc))
+
+    def _stop_slave_monitor(self) -> None:
+        if self._slave_monitor_job is not None:
+            self.root.after_cancel(self._slave_monitor_job)
+            self._slave_monitor_job = None
+        if self._slave_serial:
+            try:
+                self._slave_serial.close()
+            except OSError:
+                pass
+            self._slave_serial = None
+        self.slave_monitor_btn.configure(text="監聽副核心")
+
+    def _start_slave_monitor_tick(self) -> None:
+        self._slave_monitor_tick()
+
+    def _slave_monitor_tick(self) -> None:
+        if self._slave_serial and self._slave_serial.is_open:
+            try:
+                self._drain_slave_serial()
+            except OSError:
+                pass
+        self._slave_monitor_job = self.root.after(SLAVE_MONITOR_MS, self._slave_monitor_tick)
+
+    def _drain_slave_serial(self) -> List[str]:
+        lines: List[str] = []
+        if not self._slave_serial or not self._slave_serial.is_open:
+            return lines
+        while self._slave_serial.in_waiting:
+            raw = self._slave_serial.readline()
+            if not raw:
+                break
+            line = raw.decode(errors="replace").strip()
+            if line:
+                lines.append(line)
+                self._append_ss_rx_log(f"< {line}")
+        return lines
+
+    def _send_slave_direct(self, command: str, log: bool = True) -> str:
+        if not self._slave_serial or not self._slave_serial.is_open:
+            raise RuntimeError("尚未監聽副核心 USB")
+        self._slave_serial.write((command + "\n").encode())
+        self._slave_serial.flush()
+        if log:
+            self._append_ss_rx_log(f"> USB {command}")
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            lines = self._drain_slave_serial()
+            for line in lines:
+                if line.startswith(("PONG", "OK", "ERR", "SSRX:", "SLAVE:", "OUT:", "IN:")):
+                    return line
+            time.sleep(0.05)
+        return ""
+
+    def _query_ssdiag(self) -> None:
+        try:
+            resp = self._send_command("SSDIAG?")
+            self.ss_diag_summary_var.set(f"主核心 SS：{resp}")
+        except RuntimeError as exc:
+            messagebox.showwarning("連線", str(exc))
+
+    def _query_ssrx(self) -> None:
+        try:
+            if self._slave_serial and self._slave_serial.is_open:
+                resp = self._send_slave_direct("SSRX?")
+                self.ss_diag_summary_var.set(f"副核心 SSRX?：{resp or '(無回應)'}")
+            else:
+                resp = self._send_ss_command("SSRX?")
+                self.ss_diag_summary_var.set(f"經主核心 SS: SSRX? → {resp}")
+        except RuntimeError as exc:
+            messagebox.showwarning("連線", str(exc))
+
+    def _slave_direct_ping(self) -> None:
+        try:
+            if not self._slave_serial or not self._slave_serial.is_open:
+                messagebox.showwarning("副核心", "請先選擇組合型並按「監聽副核心」")
+                return
+            resp = self._send_slave_direct("PING")
+            if resp == "PONG":
+                messagebox.showinfo("副核心直連", "USB 直連正常 (PONG)")
+            else:
+                messagebox.showwarning("副核心直連", resp or "無回應")
+        except RuntimeError as exc:
+            messagebox.showwarning("連線", str(exc))
+
+    def _run_combined_diag(self) -> None:
+        if not self._serial or not self._serial.is_open:
+            messagebox.showwarning("組合診斷", "請先連線主核心")
+            return
+        if self.conn_mode_var.get() != "combo":
+            messagebox.showwarning("組合診斷", "請切換至「組合型（主 + 副 USB）」")
+            return
+        if not self._slave_serial or not self._slave_serial.is_open:
+            self._start_slave_monitor(auto=False)
+            if not self._slave_serial or not self._slave_serial.is_open:
+                return
+
+        self._clear_ss_rx_log()
+        self._log("=== 組合診斷開始 ===")
+        results: List[str] = []
+
+        ssdiag = self._send_command("SSDIAG?")
+        self._log(f"1. 主核心 SSDIAG? → {ssdiag}")
+        results.append(f"SSDIAG={ssdiag}")
+
+        self._append_ss_rx_log("--- 2. 副核心 USB 直送 PING ---")
+        direct = self._send_slave_direct("PING")
+        self._log(f"2. 副核心 USB PING → {direct or '(無回應)'}")
+        results.append(f"USB_PING={direct or 'NONE'}")
+
+        self._append_ss_rx_log("--- 3. 主核心 SS:PING → 副核心 D10 ---")
+        time.sleep(0.1)
+        ss_resp = self._send_ss_command("PING")
+        time.sleep(0.6)
+        ss_lines = self._drain_slave_serial()
+        ss_chars = [ln for ln in ss_lines if ln.startswith("SSRXC:")]
+        ss_cmds = [ln for ln in ss_lines if ln.startswith("SSRX:")]
+        self._log(f"3. 主核心 SS:PING → {ss_resp}")
+        self._log(f"   副核心 SS 字元數：{len(ss_chars)}，完整指令：{len(ss_cmds)}")
+        results.append(f"SS_PING={ss_resp}")
+        results.append(f"SSRXC={len(ss_chars)}")
+        results.append(f"SSRX={len(ss_cmds)}")
+
+        if direct != "PONG":
+            summary = "副核心 USB 無回應 — 請確認副核心韌體與 COM 埠"
+            level = "warn"
+        elif ss_resp != "PONG":
+            if len(ss_chars) == 0:
+                summary = (
+                    "副核心 USB 正常，但 SS 未收到字元 — 檢查接線："
+                    "主 D11→副 D10、主 D10←副 D11、GND"
+                )
+            else:
+                summary = f"SS 有收到字元但主核心回應 {ss_resp} — 可能接線或 baud 不符"
+            level = "warn"
+        else:
+            summary = "組合診斷通過：主→副 Software Serial 正常"
+            level = "ok"
+
+        self.ss_diag_summary_var.set(summary)
+        self._log(f"=== 診斷結果：{summary} ===")
+        if level == "ok":
+            messagebox.showinfo("組合診斷", summary)
+        else:
+            messagebox.showwarning("組合診斷", summary)
 
     def _require_serial(self) -> serial.Serial:
         if not self._serial or not self._serial.is_open:
@@ -487,6 +899,134 @@ class AndGateTesterApp:
         except RuntimeError as exc:
             messagebox.showwarning("連線", str(exc))
 
+    def _send_ss_command(self, cmd: str, log: bool = True) -> str:
+        resp = self._send_command(f"SS:{cmd}", log=log)
+        if resp.startswith("SSR:"):
+            slave_resp = resp[4:]
+            self._slave_status_var.set(f"副核心：{slave_resp}")
+            self._update_slave_outputs_from_response(slave_resp)
+            return slave_resp
+        if resp.startswith("ERR"):
+            self._slave_status_var.set(resp)
+        return resp
+
+    def _update_slave_outputs_from_response(self, resp: str) -> None:
+        if not resp.startswith("OUT:"):
+            return
+        for pin, val in self._parse_pin_values(resp).items():
+            if pin in self._slave_output_labels:
+                lbl = self._slave_output_labels[pin]
+                if val:
+                    lbl.configure(text="HIGH", foreground="green")
+                else:
+                    lbl.configure(text="LOW", foreground="gray")
+
+    def _ss_ping(self) -> None:
+        try:
+            resp = self._send_ss_command("PING")
+            if resp == "PONG":
+                messagebox.showinfo("副核心", "連線正常 (PONG)")
+            elif resp.startswith("ERR"):
+                messagebox.showwarning("副核心", resp)
+        except RuntimeError as exc:
+            messagebox.showwarning("連線", str(exc))
+
+    def _ss_command(self, cmd: str) -> None:
+        try:
+            self._send_ss_command(cmd)
+        except RuntimeError as exc:
+            messagebox.showwarning("連線", str(exc))
+
+    def _ss_set_output(self, pin: int, level: int) -> None:
+        try:
+            resp = self._send_ss_command(f"OUT:{pin}:{level}")
+            if resp == "OK":
+                lbl = self._slave_output_labels[pin]
+                if level:
+                    lbl.configure(text="HIGH", foreground="green")
+                else:
+                    lbl.configure(text="LOW", foreground="gray")
+            elif resp.startswith("ERR"):
+                messagebox.showwarning("副核心輸出", resp)
+        except RuntimeError as exc:
+            messagebox.showwarning("連線", str(exc))
+
+    def _ss_send_custom(self) -> None:
+        cmd = self.ss_cmd_var.get().strip()
+        if not cmd:
+            return
+        try:
+            self._send_ss_command(cmd)
+        except RuntimeError as exc:
+            messagebox.showwarning("連線", str(exc))
+
+    @staticmethod
+    def _period_sec_to_ms(sec: float) -> int:
+        clamped = max(BLINK_MIN_SEC, min(BLINK_MAX_SEC, sec))
+        return int(round(clamped * 1000))
+
+    def _on_blink_drag(self, _value: str) -> None:
+        sec = float(self.blink_period_var.get())
+        sec = max(BLINK_MIN_SEC, min(BLINK_MAX_SEC, sec))
+        self.blink_period_label.configure(text=f"{sec:.1f} s")
+        if self._blink_running and self._serial and self._serial.is_open:
+            self._schedule_blink_apply(sec)
+
+    def _cancel_blink_apply(self) -> None:
+        if self._blink_job is not None:
+            self.root.after_cancel(self._blink_job)
+            self._blink_job = None
+
+    def _schedule_blink_apply(self, sec: float) -> None:
+        self._cancel_blink_apply()
+        self._blink_job = self.root.after(
+            BLINK_DEBOUNCE_MS, lambda s=sec: self._apply_blink_live(s)
+        )
+
+    def _apply_blink_live(self, sec: float) -> None:
+        self._blink_job = None
+        period_ms = self._period_sec_to_ms(sec)
+        if period_ms == self._last_blink_ms:
+            return
+        try:
+            resp = self._send_ss_command(f"BLINK:{period_ms}", log=False)
+            if resp == "OK":
+                self._last_blink_ms = period_ms
+                self.blink_state_label.configure(text=f"閃爍中 {sec:.1f}s", foreground="green")
+        except (RuntimeError, OSError):
+            pass
+
+    def _start_blink(self) -> None:
+        sec = float(self.blink_period_var.get())
+        period_ms = self._period_sec_to_ms(sec)
+        try:
+            resp = self._send_ss_command(f"BLINK:{period_ms}")
+            if resp == "OK":
+                self._blink_running = True
+                self._last_blink_ms = period_ms
+                self.blink_state_label.configure(text=f"閃爍中 {sec:.1f}s", foreground="green")
+                lbl = self._slave_output_labels[13]
+                lbl.configure(text="BLINK", foreground="green")
+            elif resp.startswith("ERR"):
+                messagebox.showwarning("LED 閃爍", resp)
+        except RuntimeError as exc:
+            messagebox.showwarning("連線", str(exc))
+
+    def _stop_blink(self) -> None:
+        try:
+            self._cancel_blink_apply()
+            resp = self._send_ss_command("BLINK:0")
+            self._blink_running = False
+            self._last_blink_ms = None
+            self.blink_state_label.configure(text="已停止", foreground="gray")
+            if resp == "OK":
+                lbl = self._slave_output_labels[13]
+                lbl.configure(text="LOW", foreground="gray")
+            elif resp.startswith("ERR"):
+                messagebox.showwarning("LED 閃爍", resp)
+        except RuntimeError as exc:
+            messagebox.showwarning("連線", str(exc))
+
     def _apply_freq(self) -> None:
         try:
             freq = int(self.freq_var.get())
@@ -566,6 +1106,7 @@ class AndGateTesterApp:
 
     def on_close(self) -> None:
         self._stop_port_scan()
+        self._stop_slave_monitor()
         self._disconnect()
         self.root.destroy()
 

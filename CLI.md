@@ -52,13 +52,24 @@ READY ANDGATE_TESTER
 |------|------|------|
 | `IN?` | 讀取 D5、D6、D7、D8 狀態 | `IN?` |
 
-### 數位輸出（D9 ~ D13）
+### 數位輸出（主核心 D9 / D12 / D13）
 
 | 指令 | 說明 | 範例 |
 |------|------|------|
-| `OUT:<pin>:<level>` | 設定輸出腳位 High/Low | `OUT:10:1` |
-| `OUT:D<pin>:<level>` | 同上，可帶 D 前綴 | `OUT:D10:1` |
-| `OUT?` | 查詢 D9 ~ D13 狀態 | `OUT?` |
+| `OUT:<pin>:<level>` | 設定輸出腳位 High/Low | `OUT:9:1` |
+| `OUT:D<pin>:<level>` | 同上，可帶 D 前綴 | `OUT:D12:1` |
+| `OUT?` | 查詢 D9 / D12 / D13 狀態 | `OUT?` |
+
+> D10、D11 保留給 **SoftwareSerial**（9600 baud），不可作 GPIO 輸出。
+
+### 副核心轉送（SoftwareSerial D10/D11）
+
+| 指令 | 說明 | 範例 |
+|------|------|------|
+| `SS:<cmd>` | 轉送指令至副核心 Arduino | `SS:PING` |
+| 回應 | 副核心回應以 `SSR:` 為前綴 | `SSR:PONG` |
+
+副核心使用 `firmware/slave_core/slave_core.ino`，支援：`PING`、`STATUS?`、`IN?`、`OUT?`、`OUT:<pin>:<0\|1>`、`BLINK:<ms>`、`BLINK:0`（D13 閃爍週期 100~5000 ms）。
 
 `<level>`：`0` = LOW，`1` = HIGH  
 `<pin>`：僅接受 **9、10、11、12、13**
@@ -111,7 +122,9 @@ ERR:<代碼>
 | `ERR:PHASE_RANGE` | 相位超出 0 ~ 360 |
 | `ERR:TIMER` | Timer 設定失敗 |
 | `ERR:OUT_FORMAT` | `OUT:` 格式錯誤 |
-| `ERR:OUT_PIN` | 腳位非 D9 ~ D13 |
+| `ERR:OUT_PIN` | 腳位非 D9 / D12 / D13（主核心） |
+| `ERR:SS_EMPTY` | `SS:` 後無指令 |
+| `ERR:SS_TIMEOUT` | 副核心無回應（500 ms） |
 
 ---
 
@@ -241,6 +254,20 @@ OUT:9:0
 OUT:10:0
 ```
 
+### 副核心測試
+
+```
+SS:PING
+SS:STATUS?
+SS:IN?
+SS:OUT:12:1
+SS:OUT?
+SS:BLINK:1000
+SS:BLINK:0
+```
+
+`SS:BLINK:<ms>` 控制副核心 D13 LED 閃爍週期（100 ~ 5000 ms）；`SS:BLINK:0` 停止。
+
 ### 完整測試流程
 
 ```
@@ -292,7 +319,7 @@ C:\ProgramData\anaconda3\python.exe -c "import serial; s=serial.Serial('COM5',11
 | D7 | `IN?` |
 | D8 | `IN?` |
 | D9 | `OUT:9:0` / `OUT:9:1` / `OUT?` |
-| D10 | `OUT:10:0` / `OUT:10:1` / `OUT?` |
-| D11 | `OUT:11:0` / `OUT:11:1` / `OUT?` |
+| D10 | SoftwareSerial RX（連副核心 TX） |
+| D11 | SoftwareSerial TX（連副核心 RX） |
 | D12 | `OUT:12:0` / `OUT:12:1` / `OUT?` |
 | D13 | `OUT:13:0` / `OUT:13:1` / `OUT?` |

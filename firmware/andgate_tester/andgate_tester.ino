@@ -1,10 +1,12 @@
 /*
- * Arduino Nano AND Gate Tester (ATmega328P)
- * D2/D3 = waveform outputs, D5-D8 = inputs, D9-D13 = GPIO outputs
- * Serial @ 115200 baud
+ * Arduino Nano AND Gate Tester (ATmega328P) — Master
+ * D2/D3 = waveform, D5-D8 = inputs, D9/D12/D13 = GPIO outputs
+ * D10/D11 = SoftwareSerial to slave (RX=10, TX=11)
+ * USB Serial @ 115200 baud
  */
 
 #include <Arduino.h>
+#include <SoftwareSerial.h>
 #include <avr/interrupt.h>
 #include <avr/io.h>
 #include <string.h>
@@ -14,8 +16,15 @@
 #define PIN_A_MASK (1 << PIN_A_BIT)
 #define PIN_B_MASK (1 << PIN_B_BIT)
 
+static const uint8_t SS_RX_PIN = 10;
+static const uint8_t SS_TX_PIN = 11;
+static const uint32_t SS_BAUD = 9600;
+static const uint32_t SS_TIMEOUT_MS = 500UL;
+
 static const uint8_t INPUT_PINS[] = {5, 6, 7, 8};
-static const uint8_t OUTPUT_PINS[] = {9, 10, 11, 12, 13};
+static const uint8_t OUTPUT_PINS[] = {9, 12, 13};
+
+static SoftwareSerial g_softSerial(SS_RX_PIN, SS_TX_PIN);
 
 static const uint32_t MAX_ISR_HZ = 80000UL;
 static const uint32_t MIN_FREQ_HZ = 10UL;
@@ -45,6 +54,60 @@ static void detachTimer2Pwm(void) {
   OCR2B = 0;
 }
 
+static void ssInit(void) {
+  g_softSerial.begin(SS_BAUD);
+}
+
+static bool readSoftSerialLine(char *buf, size_t cap) {
+  size_t len = 0;
+  uint32_t start = millis();
+  while (millis() - start < SS_TIMEOUT_MS) {
+    while (g_softSerial.available() > 0) {
+      char c = (char)g_softSerial.read();
+      if (c == '\n' || c == '\r') {
+        if (len > 0) {
+          buf[len] = '\0';
+          return true;
+        }
+      } else if (len < cap - 1) {
+        buf[len++] = c;
+      }
+    }
+  }
+  if (len > 0) {
+    buf[len] = '\0';
+    return true;
+  }
+  return false;
+}
+
+static void sendSsDiag(void) {
+  Serial.print(F("SSDIAG:RX=D"));
+  Serial.print(SS_RX_PIN);
+  Serial.print(F(",TX=D"));
+  Serial.print(SS_TX_PIN);
+  Serial.print(F(",BAUD="));
+  Serial.print(SS_BAUD);
+  Serial.print(F(",AVAIL="));
+  Serial.println(g_softSerial.available());
+}
+
+static void forwardToSlave(const char *cmd) {
+  while (g_softSerial.available() > 0) {
+    (void)g_softSerial.read();
+  }
+  g_softSerial.print(cmd);
+  g_softSerial.print('\n');
+
+  char resp[80];
+  if (readSoftSerialLine(resp, sizeof(resp))) {
+    Serial.print(F("SSR:"));
+    Serial.println(resp);
+  } else {
+    Serial.println(F("ERR:SS_TIMEOUT"));
+  }
+}
+
 static void gpioInit(void) {
   pinMode(2, OUTPUT);
   pinMode(3, OUTPUT);
@@ -55,11 +118,13 @@ static void gpioInit(void) {
     pinMode(INPUT_PINS[i], INPUT);
   }
 
-  for (uint8_t i = 0; i < 5; i++) {
+  for (uint8_t i = 0; i < 3; i++) {
     uint8_t pin = OUTPUT_PINS[i];
     pinMode(pin, OUTPUT);
     digitalWrite(pin, LOW);
   }
+
+  ssInit();
 }
 
 static uint16_t calcStepsPerCycle(uint32_t freq_hz) {
@@ -179,13 +244,13 @@ static void sendInputs(void) {
 }
 
 static void sendOutputs(void) {
-  for (uint8_t i = 0; i < 5; i++) {
+  for (uint8_t i = 0; i < 3; i++) {
     uint8_t pin = OUTPUT_PINS[i];
     Serial.print(F("D"));
     Serial.print(pin);
     Serial.print(F("="));
     Serial.print(digitalRead(pin));
-    if (i < 4) {
+    if (i < 2) {
       Serial.print(F(","));
     }
   }
@@ -209,7 +274,7 @@ static bool parseUint(const char *s, uint32_t *out) {
 }
 
 static bool isOutputPin(uint8_t pin) {
-  for (uint8_t i = 0; i < 5; i++) {
+  for (uint8_t i = 0; i < 3; i++) {
     if (OUTPUT_PINS[i] == pin) {
       return true;
     }
@@ -326,6 +391,20 @@ static void handleCommand(char *line) {
     g_phase_deg = (uint16_t)deg;
     g_phase_offset = calcPhaseOffset(g_phase_deg, g_steps_per_cycle);
     Serial.println(F("OK"));
+    return;
+  }
+
+  if (strcmp(line, "SSDIAG?") == 0) {
+    sendSsDiag();
+    return;
+  }
+
+  if (strncmp(line, "SS:", 3) == 0) {
+    if (line[3] == '\0') {
+      Serial.println(F("ERR:SS_EMPTY"));
+      return;
+    }
+    forwardToSlave(line + 3);
     return;
   }
 
