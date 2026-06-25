@@ -2,6 +2,20 @@
 
 from __future__ import annotations
 
+import os
+import sys
+
+
+def _configure_frozen_tcl_tk() -> None:
+    """Set Tcl/Tk library paths when running as PyInstaller onefile."""
+    if getattr(sys, "frozen", False):
+        base = sys._MEIPASS
+        os.environ.setdefault("TCL_LIBRARY", os.path.join(base, "tcl", "tcl8.6"))
+        os.environ.setdefault("TK_LIBRARY", os.path.join(base, "tk", "tk8.6"))
+
+
+_configure_frozen_tcl_tk()
+
 import re
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk

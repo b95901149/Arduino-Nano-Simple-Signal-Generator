@@ -19,3 +19,5 @@ Desktop.ini
 
 # PyInstaller 建置暫存（release/ 內 .exe 需納入版控）
 build/
+release/debug*.exe
+release/*-debug.exe
